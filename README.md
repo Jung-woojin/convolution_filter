@@ -163,21 +163,210 @@ def box_kernel(size=3):
 
 ### 2.2 고역통과 필터 (High-pass Filters)
 
-#### Sobel Operator
+#### **📊 X 축/ Y 축 관점: 필터를 축별로 분리해서 보는 이유**
 
-**X 방향**:
+**핵심 개념**:
+```
+이미지 = 수평 방향 변화 (Y 축 변화) + 수직 방향 변화 (X 축 변화)
+
+X 축 필터 → Y 방향 gradient (수직 에지 검출)
+Y 축 필터 → X 방향 gradient (수평 에지 검출)
+```
+
+**왜 축별로 분리할까?**
+
+1. **방향성 특징 추출**
+   - 수평선/수직선 구분
+   - 텍스처 방향 분석
+   - 객체 윤곽 방향 이해
+
+2. **문제별 최적화**
+   - OCR: 수평선 강조 (문자 baseline)
+   - 건축: 수직선 강조 (빌딩 라인)
+   - 지질: 방향성 패턴 분석
+
+3. **컴퓨팅 효율**
+   - 필요 방향만 처리
+   - 분리 필터링 후 fusion
+   - 병렬 처리 최적화
+
+---
+
+#### Sobel Operator - 축별 분리
+
+**X 방향 (수직 에지 검출)**:
 ```
 Gx = [ -1  0  1 ]
      [ -2  0  2 ]
      [ -1  0  1 ]
+
+이 필터는 Y 축을 따라 변화하는 에지 (수직 에지) 검출
+예시: |   |   |   |   |   (문자, 기둥, 문)
 ```
 
-**Y 방향**:
+**Y 방향 (수평 에지 검출)**:
 ```
 Gy = [ -1 -2 -1 ]
      [  0  0  0 ]
      [  1  2  1 ]
+
+이 필터는 X 축을 따라 변화하는 에지 (수평 에지) 검출
+예시: ━━━━
+      ━━━━  (바닥, 하늘 경계, 선)
 ```
+
+**PyTorch 구현**:
+```python
+class SobelFilter(nn.Module):
+    """Sobel edge detection - X/Y 축 분리"""
+    def __init__(self):
+        super().__init__()
+        
+        # X 축 필터: 수직 에지 검출 (Y 방향 변화)
+        self.sobel_x = torch.tensor([[-1, 0, 1],
+                                      [-2, 0, 2],
+                                      [-1, 0, 1]]).float().unsqueeze(0).unsqueeze(0)
+        
+        # Y 축 필터: 수평 에지 검출 (X 방향 변화)
+        self.sobel_y = torch.tensor([[-1, -2, -1],
+                                      [ 0,  0,  0],
+                                      [ 1,  2, 1]]).float().unsqueeze(0).unsqueeze(0)
+    
+    def forward(self, x):
+        # 각 축별 gradient 계산
+        gx = F.conv2d(x, self.sobel_x.to(x.device), padding=1)
+        gy = F.conv2d(x, self.sobel_y.to(x.device), padding=1)
+        
+        # 축별 통계
+        x_magnitude = torch.abs(gx)  # 수직 에지 강도
+        y_magnitude = torch.abs(gy)  # 수평 에지 강도
+        
+        # 전체 magnitude
+        magnitude = torch.sqrt(gx**2 + gy**2)
+        
+        # Gradient direction
+        direction = torch.atan2(gy, gx)
+        
+        return magnitude, direction, x_magnitude, y_magnitude
+```
+
+**실전 예시: 축별 특징 분석**
+
+```python
+def analyze_edge_directions(image):
+    """이미지 내 수평/수직 에지 비율 분석"""
+    
+    sobel_x = torch.tensor([[-1, 0, 1],
+                            [-2, 0, 2],
+                            [-1, 0, 1]]).float()
+    
+    sobel_y = torch.tensor([[-1, -2, -1],
+                            [ 0,  0,  0],
+                            [ 1,  2, 1]]).float()
+    
+    # 각 축별 gradient
+    gx = F.conv2d(image, sobel_x.unsqueeze(0).unsqueeze(0), padding=1)
+    gy = F.conv2d(image, sobel_y.unsqueeze(0).unsqueeze(0), padding=1)
+    
+    x_strength = torch.mean(torch.abs(gx))  # 수직 에지 강도
+    y_strength = torch.mean(torch.abs(gy))  # 수평 에지 강도
+    
+    # 방향성 비율
+    if y_strength > 0:
+        vertical_ratio = x_strength / y_strength
+    else:
+        vertical_ratio = 0
+    
+    print(f"수직 에지 강도: {x_strength:.4f}")
+    print(f"수평 에지 강도: {y_strength:.4f}")
+    print(f"방향 비율 (수직/수평): {vertical_ratio:.2f}")
+    
+    # 이미지 타입 분류
+    if vertical_ratio > 1.5:
+        print("→ 수직 구조물 강조 (빌딩, 문자, 기둥)")
+    elif vertical_ratio < 0.7:
+        print("→ 수평 구조물 강조 (지평선, 바닥)")
+    else:
+        print("→ 균형 잡힌 구조")
+```
+
+**적용 사례**:
+
+| Application | 주요 축 | 필터 활용 |
+|------|--|----|
+| **OCR** | 수평 | 문자 baseline 감지, 줄 간격 분석 |
+| **건축** | 수직 | 건물 라인, 창문 프레임 |
+| **도로** | 수평 | 차선, 도로 경계 |
+| **지질** | 방향성 | 층리 방향 분석 |
+| **의료** | 방향성 | 혈관, 신경 방향 |
+
+---
+
+#### **Advanced: Direction-Specific Filters**
+
+#### Orientation-Specific Filters
+
+**45° 필터** (주성분 분석):
+```
+D1 = [ -1 -1  0 ]
+     [ -1  0  1 ]
+     [  0  1  1 ]
+
+D2 = [  0 -1 -1 ]
+     [  1  0 -1 ]
+     [  1  1  0 ]
+```
+
+**Orthogonal 2 차 필터**:
+```python
+def create_directional_filters():
+    """8 방향 에지 검출 필터"""
+    
+    directions = [
+        # 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°
+        torch.tensor([[-1, 0, 1],
+                      [-2, 0, 2],
+                      [-1, 0, 1]]),  # 90° (수직)
+        
+        torch.tensor([[-1, -1, 0],
+                      [-1, 0, 1],
+                      [0, 1, 1]]),  # 45°
+        
+        torch.tensor([[-1, -2, -1],
+                      [ 0,  0,  0],
+                      [ 1,  2, 1]]),  # 0° (수평)
+        
+        # ... 나머지 5 방향
+    ]
+    
+    return directions
+```
+
+**Use Case: 텍스처 분석**
+
+```python
+def texture_analysis(image, kernel_size=3):
+    """텍스처 방향성 분석"""
+    
+    filters = create_directional_filters()
+    
+    # 각 방향별 response
+    responses = []
+    for i, f in enumerate(filters):
+        response = F.conv2d(image, f.unsqueeze(0).unsqueeze(0), padding=1)
+        responses.append(torch.mean(torch.abs(response)))
+    
+    # dominant direction 찾기
+    dominant_axis = torch.argmax(torch.tensor(responses))
+    
+    print(f"주 텍스처 방향: {dominant_axis}°")
+    
+    return responses
+```
+
+---
+
+#### Sobel Operator
 
 **PyTorch 구현**:
 ```python
@@ -192,7 +381,7 @@ class SobelFilter(nn.Module):
         
         self.sobel_y = torch.tensor([[-1, -2, -1],
                                       [ 0,  0,  0],
-                                      [ 1,  2,  1]]).float().unsqueeze(0).unsqueeze(0)
+                                      [ 1,  2, 1]]).float().unsqueeze(0).unsqueeze(0)
     
     def forward(self, x):
         # Convolve
@@ -213,14 +402,56 @@ class SobelFilter(nn.Module):
 - Feature extraction
 - 이미지 pre-processing
 
-#### Laplacian Operator
+#### Laplacian Operator - 2 차 미분
 
 **수식**:
 ```
 L = [ 0  -1   0 ]
     [ -1   4  -1 ]
     [ 0  -1   0 ]
+
+4 방향 모두 균등 (방향성 없음)
+X 축: -1, 4, -1 → 2 차 미분
+Y 축: -1, 4, -1 → 2 차 미분
 ```
+
+**축별 분리 Laplacian**:
+
+```python
+def separable_laplacian_kernel():
+    """X 축과 Y 축을 분리한 Laplacian"""
+    
+    # X 축 2 차 미분
+    kernel_x = torch.tensor([[-1],
+                             [4],
+                             [-1]]).float().unsqueeze(0).unsqueeze(0)
+    
+    # Y 축 2 차 미분
+    kernel_y = torch.tensor([[-1, 4, -1]]).float().unsqueeze(0).unsqueeze(0)
+    
+    return kernel_x, kernel_y
+
+def separable_laplacian(image):
+    """2 차 미분을 축별로 계산"""
+    
+    kx, ky = separable_laplacian_kernel()
+    
+    # X 축 2 차 미분
+    lx = F.conv2d(image, kx.to(image.device), padding=1)
+    
+    # Y 축 2 차 미분
+    ly = F.conv2d(image, ky.to(image.device), padding=1)
+    
+    # 합치기
+    laplacian = lx + ly
+    
+    return laplacian, lx, ly
+```
+
+**장점**:
+- ✅ **계산 효율**: 2 차 convolution → 2 차 convolution
+- ✅ **축별 분석**: X/Y 방향 2 차 미분 개별 분석
+- ✅ **병렬 처리**: 축별 독립적 계산
 
 **PyTorch 구현**:
 ```python
@@ -953,4 +1184,4 @@ amp.init(model, optimizer, opt_level='O1')
 
 *마지막 업데이트: 2026-03-31*
 *Created for deep understanding of convolution operations*
-*Added: Deformable & Dynamic Convolution*
+*Added: X/Y axis perspective, Direction-specific filters, Deformable & Dynamic Convolution*
