@@ -2,12 +2,18 @@
 
 Convolution 연산의 수학적 기초부터 CNN 설계, 효율화까지 상세하게 다룹니다.
 
+---
+
 ## 📚 목차
 
 - [Convolution 기본 개념](#1-convolution-기본-개념)
 - [이미지 필터 종류](#2-이미지-필터-종류)
 - [CNN Convolution 연산](#3-cnn-convolution-연산)
+- [효율적 Convolution 기법](#4-효율적-convolution-기법)
 - [실전 코드 예제](#5-실전-코드-예제)
+- [성능 최적화 가이드](#6-성능-최적화-가이드)
+
+---
 
 ## 1. Convolution 기본 개념
 
@@ -28,113 +34,701 @@ y[n] = (x * h)[n] = Σₖ₌₋∞⁺∞ x[k] · h[n-k]
 (I * K)(i, j) = Σₘ₌₀ᴹ⁻¹ Σₙ₌₀ᴺ⁻¹ I(i-m, j-n) · K(m, n)
 ```
 
-### 1.2 핵심 파라미터
+여기서:
+- `I`: 입력 이미지
+- `K`: 커널 (필터)
+- `(m, n)`: 커널 좌표
+- `(i, j)`: 출력 좌표
 
-| 파라미터 | 설명 |
-|------|--|
-| **Kernel Size** | 커널 크기 (3×3, 5×5, 7×7 등) |
-| **Stride** | 슬라이딩 간격 |
-| **Padding** | 주변 패딩 (same/valid) |
-| **Dilation** | dilation rate |
+### 1.2 기하학적 직관
+
+**Convolution = 슬라이딩 윈도우 연산**
+
+```
+입력 이미지:          커널:            출력:
+┌──────┐           ┌──┐              ┌──┐
+│1 2 3 │   ●       │3 1 │     =       │●│
+│4 5 6 │   +       │1 -2│     →       │●│
+│7 8 9 │           │-1 3│              │●│
+└──────┘           └──┘              └──┘
+
+각 위치에서:
+- 커널을 이미지 위에 슬라이딩
+- 해당 영역과 점곱 (element-wise multiply)
+- 합산하여 출력 픽셀 계산
+```
+
+### 1.3 핵심 파라미터
+
+| 파라미터 | 설명 | 영향 |
+|------|--|----|
+| **Kernel Size** | 커널 크기 (3×3, 5×5, 7×7 등) | receptive field, 계산량 |
+| **Stride** | 슬라이딩 간격 | 출력 크기, downsampling |
+| **Padding** | 주변 패딩 (same/valid) | 출력 크기 보존 여부 |
+| **Dilation** | dilation rate | receptive field 확장 |
 
 **출력 크기 공식**:
 ```
 Output = (Input - Kernel + 2×Padding - 1) / Stride + 1
 ```
 
+**예시**:
+```python
+# Input: 224×224, Kernel: 3×3, Stride: 1, Padding: 1
+Output = (224 - 3 + 2×1 - 1) / 1 + 1 = 224×224 (크기 보존)
+
+# Input: 224×224, Kernel: 3×3, Stride: 2, Padding: 1
+Output = (224 - 3 + 2×1 - 1) / 2 + 1 = 112×112 (downsampling)
+```
+
+### 1.4 Convolution vs Cross-Correlation
+
+**수학적으로 다름**:
+- **Convolution**: 커널을 반전 후 연산
+- **Cross-correlation**: 커널 반전 없이 연산
+
+**CNN 에서는 Cross-correlation**:
+```python
+# 실제 CNN 은 convolution 이 아니라 cross-correlation 사용
+# 하지만 관례상 "convolution" 이라고 부름
+```
+
+---
+
 ## 2. 이미지 필터 종류
 
-### 2.1 저역통과 필터 (Low-pass)
+### 2.1 저역통과 필터 (Low-pass Filters)
 
 #### Gaussian Blur
 
+**수식**:
+```
+G(x, y) = (1/(2πσ²)) · exp(-(x²+y²)/(2σ²))
+```
+
+**PyTorch 구현**:
 ```python
 import torch
 import torch.nn.functional as F
 
 def gaussian_kernel(size=5, sigma=1.0):
+    """Generate Gaussian kernel"""
     coords = torch.arange(size, dtype=torch.float)
     x, y = torch.meshgrid(coords, coords, indexing='ij')
+    
+    # Gaussian function
     kernel = torch.exp(-((x - size//2)**2 + **(y - size//2)2) / (2 * sigma**2))
     kernel = kernel / kernel.sum()
+    
     return kernel.unsqueeze(0).unsqueeze(0)
+
+def apply_gaussian_blur(image, sigma=1.0):
+    """Apply Gaussian blur"""
+    kernel = gaussian_kernel(size=5, sigma=sigma)
+    kernel = kernel.repeat(image.shape[1], 1, 1)  # Channels first
+    
+    # Padding
+    padding = 2
+    padded = F.pad(image, (padding, padding, padding, padding), mode='replicate')
+    
+    # Convolution
+    output = F.conv2d(padded, kernel, padding=0, groups=image.shape[1])
+    
+    return output
 ```
 
-### 2.2 고역통과 필터 (High-pass)
+**용도**:
+- 노이즈 제거
+- 이미지 축소 전 anti-aliasing
+- Smoothness regularization
+
+#### Box Filter (Moving Average)
+
+```python
+def box_kernel(size=3):
+    """Generate uniform box filter"""
+    return torch.ones(size, size) / (size * size)
+```
+
+**용도**:
+- Simple blurring
+- Pre-processing for edge detection
+
+---
+
+### 2.2 고역통과 필터 (High-pass Filters)
 
 #### Sobel Operator
 
+**X 방향**:
+```
+Gx = [ -1  0  1 ]
+     [ -2  0  2 ]
+     [ -1  0  1 ]
+```
+
+**Y 방향**:
+```
+Gy = [ -1 -2 -1 ]
+     [  0  0  0 ]
+     [  1  2  1 ]
+```
+
+**PyTorch 구현**:
 ```python
 class SobelFilter(nn.Module):
+    """Sobel edge detection"""
     def __init__(self):
         super().__init__()
-        self.sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).float()
-        self.sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).float()
+        
+        self.sobel_x = torch.tensor([[-1, 0, 1],
+                                      [-2, 0, 2],
+                                      [-1, 0, 1]]).float().unsqueeze(0).unsqueeze(0)
+        
+        self.sobel_y = torch.tensor([[-1, -2, -1],
+                                      [ 0,  0,  0],
+                                      [ 1,  2,  1]]).float().unsqueeze(0).unsqueeze(0)
     
     def forward(self, x):
-        gx = F.conv2d(x, self.sobel_x, padding=1)
-        gy = F.conv2d(x, self.sobel_y, padding=1)
-        return torch.sqrt(gx**2 + gy**2)
+        # Convolve
+        gx = F.conv2d(x, self.sobel_x.to(x.device), padding=1)
+        gy = F.conv2d(x, self.sobel_y.to(x.device), padding=1)
+        
+        # Magnitude
+        magnitude = torch.sqrt(gx**2 + gy**2)
+        
+        # Gradient direction
+        direction = torch.atan2(gy, gx)
+        
+        return magnitude, direction
 ```
+
+**용도**:
+- Edge detection
+- Feature extraction
+- 이미지 pre-processing
+
+#### Laplacian Operator
+
+**수식**:
+```
+L = [ 0  -1   0 ]
+    [ -1   4  -1 ]
+    [ 0  -1   0 ]
+```
+
+**PyTorch 구현**:
+```python
+def laplacian_kernel():
+    """Laplacian filter kernel"""
+    return torch.tensor([[0, -1, 0],
+                         [-1, 4, -1],
+                         [0, -1, 0]]).float().unsqueeze(0).unsqueeze(0)
+
+def apply_laplacian(image):
+    """Apply Laplacian filter for sharpening"""
+    kernel = laplacian_kernel()
+    kernel = kernel.repeat(image.shape[1], 1, 1)
+    
+    laplacian = F.conv2d(image, kernel, padding=1)
+    
+    # Sharpening: original - laplacian
+    sharpened = image - laplacian
+    
+    return sharpened
+```
+
+**용도**:
+- Image sharpening
+- Feature detection
+- Second derivative approximation
+
+---
+
+### 2.3 특수 필터 (Specialized Filters)
+
+#### Canny Edge Detector
+
+**Steps**:
+1. Gaussian blur
+2. Gradient calculation (Sobel)
+3. Non-maximum suppression
+4. Double thresholding
+5. Edge tracking by hysteresis
+
+```python
+class CannyEdgeDetector(nn.Module):
+    def __init__(self, sigma=1.5, thresholds=(0.1, 0.2)):
+        super().__init__()
+        self.sigma = sigma
+        self.high_threshold, self.low_threshold = thresholds
+```
+
+#### Prewitt Operator
+
+```
+Px = [ -1  0  1 ]
+     [ -1  0  1 ]
+     [ -1  0  1 ]
+
+Py = [ -1 -1 -1 ]
+     [  0  0  0 ]
+     [  1  1  1 ]
+```
+
+---
+
+### 2.4 고급 필터 (Advanced Filters)
+
+#### Gabor Filter
+
+**수식**:
+```
+G(x, y; λ, θ, φ, σ, γ) = exp(-π²·(x'² + γ²·y'²) / (2·σ²))
+                         · cos(2π·x'/λ + φ)
+
+where:
+  x' = x·cosθ + y·sinθ
+  y' = -x·sinθ + y·cosθ
+```
+
+**PyTorch 구현**:
+```python
+def gabor_kernel(frequency=0.1, theta=0, sigma=7, phase=0):
+    """Generate Gabor filter kernel"""
+    size = 21
+    half = size // 2
+    
+    x = np.arange(-half, half + 1)
+    y = np.arange(-half, half + 1)
+    X, Y = np.meshgrid(x, y)
+    
+    # Rotation
+    theta_rad = np.deg2rad(theta)
+    x_rot = X * np.cos(theta_rad) + Y * np.sin(theta_rad)
+    y_rot = -X * np.sin(theta_rad) + Y * np.cos(theta_rad)
+    
+    # Gabor function
+    kernel = np.exp(-np.pi**2 * (x_rot**2 + sigma**2 * y_rot**2) / (2 * sigma**2))
+    kernel *= np.cos(2 * np.pi * frequency * x_rot + phase)
+    kernel = kernel / np.abs(kernel).max()
+    
+    return torch.from_numpy(kernel).float()
+```
+
+**용도**:
+- Texture analysis
+- Orientation detection
+- Human vision modeling
+
+#### Bilateral Filter
+
+**특징**:
+- Spatial proximity 고려
+- Intensity similarity 고려
+- Edge-preserving smoothing
+
+---
 
 ## 3. CNN Convolution 연산
 
+### 3.1 CNN 의 Convolution 구조
+
+**Input**: (B, C, H, W)  
+**Kernel**: (O, C, K, K)  
+**Output**: (B, O, H', W')
+
 ```python
+# PyTorch Conv2D
 import torch.nn as nn
 
-# Standard Conv2D
 conv = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, 
                  stride=1, padding=1, bias=True)
-
-# 1×1 Convolution (Channel mixing)
-conv_1x1 = nn.Conv2d(128, 64, kernel_size=1)
-
-# Depthwise Convolution (Efficient)
-depthwise = nn.Conv2d(256, 256, 3, padding=1, groups=256)
-
-# Dilated Convolution
-dilated = nn.Conv2d(256, 256, 3, dilation=2)
 ```
+
+### 3.2 1×1 Convolution
+
+**Purpose**:
+- Channel mixing
+- Dimensionality reduction
+- Non-linearity 추가
+
+```python
+# 1×1 conv
+conv_1x1 = nn.Conv2d(128, 64, kernel_size=1)
+# Equivalent to: Linear layer applied per pixel
+```
+
+**Math**:
+```
+For each spatial position (i, j):
+output[i,j] = W @ input[i,j] + b
+where W: (out_channels, in_channels)
+```
+
+### 3.3 Group Convolution
+
+**Purpose**: Reduce computation, increase parameter independence
+
+```python
+# Group convolution
+conv = nn.Conv2d(
+    in_channels=256,
+    out_channels=256,
+    kernel_size=3,
+    groups=4  # 4 separate groups
+)
+```
+
+**Compute reduction**:
+- Standard: (C×C×K×K) FLOPs
+- Group=4: (C×(C/4)×K×K) × 4 = (C×C×K×K) FLOPs (same) but independent
+
+### 3.4 Depthwise Convolution
+
+**Purpose**: Parameter and computation efficiency
+
+```python
+# Depthwise separable convolution
+conv_dw = nn.Conv2d(256, 256, kernel_size=3, padding=1, groups=256)
+conv_pw = nn.Conv2d(256, 256, kernel_size=1)
+```
+
+**Efficiency**:
+- Standard: C×C×K×K
+- Depthwise: C×K×K (depthwise) + C×C (pointwise)
+- **Speedup**: ~8-9× for 3×3 kernel
+
+### 3.5 Dilated Convolution
+
+**Purpose**: Increase receptive field without increasing parameters
+
+```python
+# Dilated convolution
+conv = nn.Conv2d(256, 256, kernel_size=3, dilation=2)
+```
+
+**Receptive field**:
+```
+Normal 3×3: RF = 3×3
+Dilated=2:  RF = 5×5
+Dilated=4:  RF = 9×9
+```
+
+---
 
 ## 4. 효율적 Convolution 기법
 
 ### 4.1 Depthwise Separable Convolution
 
+**Structure**:
+```
+Standard Conv:
+Input (256) → [Conv 256→256] → Output (256)
+              3×3 kernel × 256² parameters
+
+Depthwise Separable:
+Input (256) → [Depthwise 3×3] → [Pointwise 1×1] → Output (256)
+              3×3×256 params       1×1×256² params
+              Total: ~1/8 params
+```
+
+**MobileNet architecture**:
 ```python
 class DepthwiseSeparableBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.dw = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
+        
+        # Depthwise convolution
+        self.dw = nn.Conv2d(channels, channels, 3, padding=1, 
+                           groups=channels, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
+        self.relu1 = nn.ReLU6()
+        
+        # Pointwise convolution
         self.pw = nn.Conv2d(channels, channels, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
+        self.relu2 = nn.ReLU6()
     
     def forward(self, x):
         x = self.dw(x)
         x = self.bn1(x)
+        x = self.relu1(x)
         x = self.pw(x)
         x = self.bn2(x)
-        return F.relu(x)
+        x = self.relu2(x)
+        return x
 ```
 
-### 4.2 FFT-based Convolution
+### 4.2 Fast Fourier Transform (FFT) based Convolution
 
+**Concept**: 
+```
+Spatial: Convolution = O(n²)
+Frequency: Multiplication = O(n log n)
+```
+
+**PyTorch 구현**:
 ```python
 def fft_convolution(x, kernel):
+    """Convolution using FFT"""
+    # FFT
     x_fft = torch.fft.fft2(x)
     k_fft = torch.fft.fft2(kernel)
+    
+    # Element-wise multiplication
     result_fft = x_fft * k_fft
-    return torch.fft.ifft2(result_fft).real
+    
+    # IFFT
+    result = torch.fft.ifft2(result_fft).real
+    
+    return result
 ```
+
+**Use cases**:
+- Large kernels (15×15 or larger)
+- Fixed kernel (filtering)
+- When kernel size ≫ image size
+
+### 4.3 Winograd Minimal Filtering Algorithm
+
+**Purpose**: Optimize small kernels (3×3, 5×5)
+
+**Speedup**: 
+- 3×3: ~25% faster
+- 5×5: ~40% faster
+
+**Note**: More complex implementation, typically in optimized libraries (cuDNN, MKLDNN)
+
+### 4.4 Im2Col + GEMM
+
+**Concept**: Reshape convolution to matrix multiplication
+
+```python
+def im2col_convolution(x, kernel, kernel_size=3, stride=1, padding=1):
+    """Convert convolution to GEMM using im2col"""
+    B, C, H, W = x.shape
+    out_H = (H + 2*padding - kernel_size) // stride + 1
+    out_W = (W + 2*padding - kernel_size) // stride + 1
+    
+    # Im2Col
+    cols = F.unfold(x, kernel_size, padding=padding, stride=stride)
+    # cols: (B, C*kernel*kernel, out_H*out_W)
+    
+    # GEMM
+    kernel_col = kernel.view(kernel.shape[0], -1)
+    output = torch.matmul(kernel_col, cols)
+    
+    # Reshape
+    output = output.view(B, -1, out_H, out_W)
+    
+    return output
+```
+
+---
+
+## 5. 실전 코드 예제
+
+### 5.1 Custom Convolution Layer
+
+```python
+class CustomConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3):
+        super().__init__()
+        
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, 
+                             padding=kernel_size//2, bias=False)
+        
+        # Initialize weights
+        nn.init.kaiming_normal_(self.conv.weight, mode='fan_out')
+    
+    def forward(self, x):
+        return F.relu(self.conv(x))
+```
+
+### 5.2 Adaptive Filter Selection
+
+```python
+class AdaptiveFilterSelection(nn.Module):
+    """Select appropriate filter based on local image characteristics"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # Edge detector
+        self.sobel_x = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+        self.sobel_y = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+        
+        # Blur filter
+        self.gaussian = nn.Conv2d(1, 1, 5, padding=2, bias=False)
+        
+        # Initialize
+        self.sobel_x.weight.data = torch.tensor([[[-1,0,1],[-2,0,2],[-1,0,1]]])
+        self.sobel_y.weight.data = torch.tensor([[[-1,-2,-1],[0,0,0],[1,2,1]]])
+        self.gaussian.weight.data = gaussian_kernel(5).unsqueeze(0)
+    
+    def forward(self, x):
+        # Detect edges
+        edges_x = torch.abs(self.sobel_x(x))
+        edges_y = torch.abs(self.sobel_y(x))
+        edges = edges_x + edges_y
+        
+        # Apply blur to smooth areas
+        blur = self.gaussian(x)
+        
+        # Adaptive: edge regions keep original, smooth regions blurred
+        alpha = torch.sigmoid(edges * 10)
+        output = alpha * x + (1 - alpha) * blur
+        
+        return output
+```
+
+### 5.3 Multi-scale Convolution Ensemble
+
+```python
+class MultiScaleConv(nn.Module):
+    """Combine convolutions at multiple scales"""
+    
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        
+        self.conv3 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv5 = nn.Conv2d(in_channels, out_channels, 5, padding=2)
+        self.conv7 = nn.Conv2d(in_channels, out_channels, 7, padding=3)
+        
+        self.fusion = nn.Conv2d(out_channels * 3, out_channels, 1)
+    
+    def forward(self, x):
+        c3 = self.conv3(x)
+        c5 = self.conv5(x)
+        c7 = self.conv7(x)
+        
+        # Concatenate and fuse
+        combined = torch.cat([c3, c5, c7], dim=1)
+        output = self.fusion(combined)
+        
+        return F.relu(output)
+```
+
+---
+
+## 6. 성능 최적화 가이드
+
+### 6.1 Kernel Size 선택
+
+| 사용 목적 | 추천 크기 | 이유 |
+|------|-------|----|
+| Edge detection | 3×3 | Local gradient |
+| Texture analysis | 5×5~7×7 | Larger context |
+| Object detection | 3×3 (stacked) | Deeper network |
+| Semantic segmentation | 3×3, 5×5 | Balance |
+
+**Rule of thumb**:
+- Small objects: 3×3, 5×5
+- Large objects: 7×7, or use dilated conv
+
+### 6.2 Padding 전략
+
+**Same padding** (output = input):
+```
+padding = (kernel_size - 1) / 2
+```
+
+**Valid padding** (no padding):
+- Smaller output
+- Less boundary artifacts
+
+**Recommendation**:
+- **Training**: Same padding for most layers
+- **Boundary-sensitive tasks**: Reflect/pad replication
+
+### 6.3 Stride 튜닝
+
+**Downsampling**:
+```
+Stride 1: No downsampling
+Stride 2: 50% spatial reduction
+Stride 3: ~67% spatial reduction
+```
+
+**Guidelines**:
+- **Early layers**: stride=1 (preserve details)
+- **Later layers**: stride=2 (spatial reduction)
+- **Object detection**: Additional stride=2 or FPN
+
+### 6.4 Dilation 전략
+
+```python
+# Multi-scale receptive field
+dilation_rates = [1, 2, 4, 8]
+
+# ASPP (Atrous Spatial Pyramid Pooling)
+aspp_modules = nn.ModuleList([
+    nn.Conv2d(channels, channels, 1, dilation=1),
+    nn.Conv2d(channels, channels, 3, dilation=2),
+    nn.Conv2d(channels, channels, 3, dilation=4),
+    nn.Conv2d(channels, channels, 3, dilation=8)
+])
+```
+
+**Use cases**:
+- Semantic segmentation
+- Dense prediction tasks
+- Multi-scale feature extraction
+
+### 6.5 Memory Optimization
+
+**Gradient checkpointing**:
+```python
+from torch.utils.checkpoint import checkpoint
+
+def conv_block(x):
+    return F.relu(conv(x))
+
+# Memory efficient
+output = checkpoint(conv_block, x)
+```
+
+**Reduced precision**:
+```python
+# Mixed precision training
+from apex.amp import initialize, amp
+
+amp.init(model, optimizer, opt_level='O1')
+```
+
+---
 
 ## 📊 성능 비교
 
-| Model | Type | Params (M) | FLOPs (G) |
-|-------|-----|--|---|
-| **ResNet-50** | Standard | 25.6 | 4.1 |
-| **MobileNet-V2** | Depthwise | 3.5 | 0.35 |
-| **EfficientNet-B0** | Depthwise | 5.3 | 0.4 |
+### Convolution Types FLOPs Comparison
+
+| Model | Type | Params (M) | FLOPs (G) | Top-1 Accuracy (%) |
+|-------|-----|----------|---------|---------|
+| **ResNet-50** | Standard | 25.6 | 4.1 | 76.1 |
+| **MobileNet-V2** | Depthwise | 3.5 | 0.35 | 72.0 |
+| **ShuffleNet-V2** | Shuffle | 2.3 | 0.15 | 72.0 |
+| **EfficientNet-B0** | Depthwise | 5.3 | 0.4 | 77.0 |
+
+### Kernel Size Impact
+
+| Kernel | Params (3×3 vs 5×5) | Compute (3×3 vs 5×5) | mAP Gain |
+|--------|------|-----|--|
+| **3×3** | 9 units | 9 units | Baseline |
+| **5×5** | 25 units | 25 units | +0.5% |
+| **7×7** | 49 units | 49 units | +0.3% |
+| **2× 3×3** | 18 units | 18 units | +0.2% |
+
+---
+
+## 📚 참고 자료
+
+- **Deep Learning Book**, Goodfellow et al.
+- **Fast AI**, Jeremy Howard
+- **PyTorch Documentation**: torch.nn.Conv2d
+- **TensorFlow**: tf.nn.conv2d
 
 ---
 
 *마지막 업데이트: 2026-03-30*
+*Created for deep understanding of convolution operations*
